@@ -69,6 +69,16 @@ def _normalize_moe_layer_freq(moe_layer_freq):
     return moe_layer_freq
 
 
+def _normalize_rope_scaling(rope_scaling):
+    """Ensure rope_scaling has a rope_type key for Megatron runtime."""
+    if not isinstance(rope_scaling, dict):
+        return rope_scaling
+    rope_scaling = dict(rope_scaling)
+    if 'type' in rope_scaling and 'rope_type' not in rope_scaling:
+        rope_scaling['rope_type'] = rope_scaling['type']
+    return rope_scaling
+
+
 class DataSource(str, Enum):
     """Data source for GKD training."""
     DATASET = 'dataset'  # Offline: use responses from dataset
@@ -157,6 +167,9 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                              f'Teacher model path: {teacher_model_path}')
 
         teacher_megatron_config = convert_hf_config(teacher_config)
+        if 'rope_scaling' in teacher_megatron_config:
+            teacher_megatron_config['rope_scaling'] = _normalize_rope_scaling(
+                teacher_megatron_config['rope_scaling'])
         if 'moe_layer_freq' in teacher_megatron_config:
             teacher_megatron_config['moe_layer_freq'] = _normalize_moe_layer_freq(
                 teacher_megatron_config['moe_layer_freq'])
