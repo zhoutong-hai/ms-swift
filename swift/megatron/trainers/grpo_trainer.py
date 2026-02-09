@@ -21,7 +21,11 @@ from dacite import from_dict
 from megatron.core import mpu
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.training import get_args, get_wandb_writer, training
-from vllm.distributed import parallel_state as vllm_ps
+
+if os.environ.get('SWIFT_SKIP_VLLM_IMPORT', '0') == '1':
+    vllm_ps = None
+else:
+    from vllm.distributed import parallel_state as vllm_ps
 
 from swift.llm import RequestConfig, RolloutInferRequest, RowPreprocessor, Template, get_packed_seq_params, to_device
 from swift.llm.infer.protocol import RolloutOutput

@@ -41,6 +41,12 @@ T = TypeVar('T')
 TensorLoRARequest = None
 _ipv6_patch_applied = False
 
+
+def _should_skip_vllm_import() -> bool:
+    # Allows training flows that do not use vLLM to avoid importing vLLM
+    # transitive dependencies at module import time.
+    return os.environ.get('SWIFT_SKIP_VLLM_IMPORT', '0') == '1'
+
 if is_vllm_available():
     from vllm.lora.request import LoRARequest
 
@@ -110,6 +116,9 @@ def patch_stateless_process_group_for_ipv6():
     This function is idempotent - calling it multiple times is safe.
     """
     global _ipv6_patch_applied
+
+    if _should_skip_vllm_import():
+        return
 
     if _ipv6_patch_applied:
         return
@@ -184,7 +193,8 @@ def patch_stateless_process_group_for_ipv6():
 
 
 # Apply IPv6 patch at module load time
-patch_stateless_process_group_for_ipv6()
+if not _should_skip_vllm_import():
+    patch_stateless_process_group_for_ipv6()
 
 
 def nanstd(tensor: torch.Tensor) -> torch.Tensor:
