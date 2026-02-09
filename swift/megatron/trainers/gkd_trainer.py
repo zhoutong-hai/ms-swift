@@ -671,6 +671,11 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         """
         student_logits = output_tensor
 
+        if teacher_logits is None:
+            raise RuntimeError(
+                'teacher_logits is None on loss stage. '
+                'Teacher forward output is missing for this microbatch.')
+
         jsd_loss = self.generalized_jsd_loss(
             student_logits=student_logits,
             teacher_logits=teacher_logits,
@@ -723,7 +728,9 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
         timers('batch-generator', log_level=2).start()
         with self.stimer(bdata=True):
-            data = next(data_iterator)
+            # RerunDataIterator replays the same microbatch dict objects in-place.
+            # Copy before mutating (pop) so replayed steps retain keys.
+            data = dict(next(data_iterator))
             data_source = data.pop('data_source', DataSource.DATASET)
             teacher_logits = data.pop('teacher_logits', None)
             data = self._prepare_batch(data, vp_stage)
