@@ -1,5 +1,6 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 import random
+import re
 from contextlib import contextmanager
 from enum import Enum
 from functools import partial
@@ -24,6 +25,48 @@ from .utils import get_swift_datasets_provider, load_megatron_model_to_gpu, offl
 from .vocab_parallel_utils import vocab_parallel_kl_div, vocab_parallel_log_softmax
 
 logger = get_logger()
+
+
+def _normalize_moe_layer_freq(moe_layer_freq):
+    """Convert HF-derived moe_layer_freq to Megatron runtime type.
+
+    Megatron runtime expects int/list[int]. In GKD teacher path we assign
+    config values directly to Megatron args, so expression strings like
+    "[0]*1+[1]*45" must be converted before model construction.
+    """
+    if moe_layer_freq is None or isinstance(moe_layer_freq, (int, list)):
+        return moe_layer_freq
+    if not isinstance(moe_layer_freq, str):
+        return moe_layer_freq
+
+    pattern = moe_layer_freq.strip()
+    if not pattern:
+        return moe_layer_freq
+
+    if '[' not in pattern:
+        try:
+            return int(pattern)
+        except ValueError:
+            return moe_layer_freq
+
+    # Keep this aligned with Megatron's argument parser: only allow
+    # comma, digits, [, ], (, ), +, and * before eval.
+    if bool(re.compile(r'[^,\d\[\]\(\)\+\*]').search(pattern)):
+        return moe_layer_freq
+
+    try:
+        value = eval(pattern, {'__builtins__': {}}, {})
+    except Exception:
+        return moe_layer_freq
+
+    if isinstance(value, list):
+        try:
+            return [int(v) for v in value]
+        except Exception:
+            return moe_layer_freq
+    if isinstance(value, int):
+        return value
+    return moe_layer_freq
 
 
 class DataSource(str, Enum):
@@ -114,6 +157,9 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                              f'Teacher model path: {teacher_model_path}')
 
         teacher_megatron_config = convert_hf_config(teacher_config)
+        if 'moe_layer_freq' in teacher_megatron_config:
+            teacher_megatron_config['moe_layer_freq'] = _normalize_moe_layer_freq(
+                teacher_megatron_config['moe_layer_freq'])
 
         # Store teacher config for temporary args override during forward
         self._teacher_megatron_config = teacher_megatron_config
