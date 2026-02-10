@@ -1,6 +1,5 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 import collections
-import json
 import logging
 import os
 import shutil
@@ -40,8 +39,7 @@ from tqdm.auto import tqdm
 from swift.llm import Template, dynamic_gradient_checkpointing
 from swift.plugin import MeanMetric
 from swift.trainers import SwiftMixin
-from swift.utils import (JsonlWriter, check_json_format, deep_getattr, format_time, get_last_valid_indices, get_logger,
-                         ms_logger_context)
+from swift.utils import JsonlWriter, deep_getattr, format_time, get_last_valid_indices, get_logger, ms_logger_context
 from ..tuners import LoraParallelLinear
 from ..utils import adapter_state_dict_context, copy_original_module_weight, patch_merge_fn, prepare_mcore_model
 from .utils import (MegatronPretrainingRandomSampler, get_batch_on_this_cp_rank, get_batch_on_this_tp_rank,
@@ -1040,15 +1038,6 @@ class BaseMegatronTrainer(ABC):
         else:
             raise ValueError(f'Source path is neither a file nor a directory: {src_path}')
 
-    def ensure_args_json_on_last_rank(self, args_path: str):
-        """Fallback for node-local save paths: last rank may not see rank0's args.json."""
-        if not is_last_rank() or os.path.exists(args_path):
-            return
-        os.makedirs(os.path.dirname(args_path), exist_ok=True)
-        with open(args_path, 'w', encoding='utf-8') as f:
-            json.dump(check_json_format(self.args.__dict__), f, ensure_ascii=False, indent=2)
-        logger.warning(f'`{args_path}` not found on last rank, generated a local fallback args.json.')
-
     def save_checkpoint(self, iteration, model, *_args, **kwargs):
         args = get_args()
         output_dir = os.path.join(args.save, f'checkpoint-{iteration}')
@@ -1056,7 +1045,6 @@ class BaseMegatronTrainer(ABC):
         origin_save = args.save
         args.save = output_dir
         args_path = os.path.join(os.path.dirname(output_dir), 'args.json')
-        self.ensure_args_json_on_last_rank(args_path)
         self.copy_path(args_path, os.path.join(output_dir, 'args.json'))
         save_peft_format = args.train_type == 'lora' and not args.merge_lora
         if args.save_safetensors and args.no_save_optim:
