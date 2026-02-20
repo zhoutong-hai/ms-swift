@@ -1,4 +1,5 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
+import os
 import random
 import re
 from contextlib import contextmanager
@@ -103,6 +104,10 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         self.use_vllm = getattr(args, 'use_vllm', False)
         self.teacher_context_field = getattr(args, 'teacher_context_field', 'context')
         self.teacher_context_separator = getattr(args, 'teacher_context_separator', '\n\n')
+        self.debug_prompt_dump = os.environ.get('SWIFT_GKD_DEBUG_PROMPT_DUMP', '0') == '1'
+        self.debug_prompt_dump_steps = int(os.environ.get('SWIFT_GKD_DEBUG_PROMPT_DUMP_STEPS', '1'))
+        self.debug_prompt_dump_max_chars = int(os.environ.get('SWIFT_GKD_DEBUG_PROMPT_DUMP_MAX_CHARS', '4000'))
+        self._debug_prompt_dump_count = 0
 
         # Get device for data processing
         self.device = torch.cuda.current_device()
@@ -411,6 +416,60 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             return batch
         return [self._inject_teacher_context(sample) for sample in batch]
 
+    def _truncate_log_text(self, text: str) -> str:
+        max_chars = self.debug_prompt_dump_max_chars
+        if max_chars <= 0:
+            return text
+        if len(text) <= max_chars:
+            return text
+        return f'{text[:max_chars]}\n... [truncated, total_chars={len(text)}]'
+
+    def _format_messages_for_log(self, sample: Dict) -> str:
+        messages = sample.get('messages')
+        if not isinstance(messages, list):
+            return f'<messages missing; sample keys={list(sample.keys())}>'
+
+        rows = []
+        for i, message in enumerate(messages):
+            role = message.get('role', 'unknown')
+            content = message.get('content', '')
+            if not isinstance(content, str):
+                content = str(content)
+            rows.append(f'[{i}] {role}: {content}')
+        return '\n'.join(rows)
+
+    def _maybe_log_prompt_sample(self, batch: List[Dict], data_source: DataSource) -> None:
+        if not self.debug_prompt_dump:
+            return
+        if self._debug_prompt_dump_count >= self.debug_prompt_dump_steps:
+            return
+        if not batch:
+            return
+
+        args = get_args()
+        if getattr(args, 'rank', 0) != 0:
+            return
+
+        student_sample = batch[0]
+        teacher_sample = self._inject_teacher_context(student_sample)
+        teacher_context = self._resolve_teacher_context(student_sample)
+
+        student_prompt = self._truncate_log_text(self._format_messages_for_log(student_sample))
+        teacher_prompt = self._truncate_log_text(self._format_messages_for_log(teacher_sample))
+        context_preview = 'none'
+        if teacher_context is not None:
+            context_preview = self._truncate_log_text(teacher_context)
+
+        logger.info(
+            f'\n[GKD Debug Prompt Dump #{self._debug_prompt_dump_count + 1}] '
+            f'step={self._step}, data_source={data_source}\n'
+            f'teacher_context_field={self.teacher_context_field}, '
+            f'teacher_context_present={teacher_context is not None}\n'
+            f'--- Student Prompt ---\n{student_prompt}\n'
+            f'--- Teacher Context ---\n{context_preview}\n'
+            f'--- Teacher Prompt ---\n{teacher_prompt}\n')
+        self._debug_prompt_dump_count += 1
+
     def _get_random_num(self) -> float:
         """Generate a deterministic random number consistent across all processes.
 
@@ -593,6 +652,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         elif data_source == DataSource.TEACHER:
             logger.warning_once('Teacher mode triggered but teacher generation is not implemented in Megatron GKD yet. '
                                 'Falling back to dataset responses.')
+
+        self._maybe_log_prompt_sample(global_batch, data_source)
 
         # Split global batch back into micro-batches for encoding
         encoded_batches = []
