@@ -107,6 +107,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         self.debug_prompt_dump = os.environ.get('SWIFT_GKD_DEBUG_PROMPT_DUMP', '0') == '1'
         self.debug_prompt_dump_steps = int(os.environ.get('SWIFT_GKD_DEBUG_PROMPT_DUMP_STEPS', '1'))
         self.debug_prompt_dump_max_chars = int(os.environ.get('SWIFT_GKD_DEBUG_PROMPT_DUMP_MAX_CHARS', '4000'))
+        self.debug_prompt_dump_tail_chars = int(os.environ.get('SWIFT_GKD_DEBUG_PROMPT_DUMP_TAIL_CHARS', '800'))
         self._debug_prompt_dump_count = 0
 
         # Get device for data processing
@@ -422,7 +423,23 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             return text
         if len(text) <= max_chars:
             return text
-        return f'{text[:max_chars]}\n... [truncated, total_chars={len(text)}]'
+
+        # Keep the beginning and end of the prompt; drop the middle for readability.
+        tail_chars = max(0, self.debug_prompt_dump_tail_chars)
+        tail_chars = min(tail_chars, max_chars - 1) if max_chars > 1 else 0
+
+        if tail_chars == 0:
+            return f'{text[:max_chars]}\n... [truncated, total_chars={len(text)}]'
+
+        head_chars = max_chars - tail_chars
+        if head_chars <= 0:
+            return f'... [head dropped, kept_tail={tail_chars}, total_chars={len(text)}]\n{text[-tail_chars:]}'
+
+        return (
+            f'{text[:head_chars]}\n'
+            f'... [middle truncated, kept_head={head_chars}, kept_tail={tail_chars}, total_chars={len(text)}]\n'
+            f'{text[-tail_chars:]}'
+        )
 
     def _format_messages_for_log(self, sample: Dict) -> str:
         messages = sample.get('messages')
