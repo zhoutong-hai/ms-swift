@@ -44,6 +44,8 @@ class RLHFMegatronArgumentsMixin:
     teacher_model: Optional[str] = field(default=None)
     teacher_model_type: Optional[str] = field(default=None)
     teacher_model_revision: Optional[str] = field(default=None)
+    teacher_context_field: Optional[str] = field(default='context')
+    teacher_context_separator: str = '\n\n'
     lmbda: float = 0.5  # On-policy probability: with prob lmbda, use student-generated responses
     seq_kd: bool = False  # Sequential KD: use teacher-generated responses when not on-policy
     offload_teacher_model: bool = False  # Offload teacher model to CPU to save GPU memory

@@ -101,6 +101,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         self.sft_alpha = getattr(args, 'sft_alpha', 0.0)  # Weight for SFT loss
         assert args.teacher_model is not None, 'Teacher model path is required for GKD training'
         self.use_vllm = getattr(args, 'use_vllm', False)
+        self.teacher_context_field = getattr(args, 'teacher_context_field', 'context')
+        self.teacher_context_separator = getattr(args, 'teacher_context_separator', '\n\n')
 
         # Get device for data processing
         self.device = torch.cuda.current_device()
@@ -360,6 +362,55 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         encoded_batch['num_samples'] = len(batch)
         return encoded_batch
 
+    def _resolve_teacher_context(self, sample: Dict) -> Optional[str]:
+        if not self.teacher_context_field:
+            return None
+        context = sample.get(self.teacher_context_field)
+        if context is None:
+            return None
+        if not isinstance(context, str):
+            context = str(context)
+        if not context.strip():
+            return None
+        return context
+
+    def _inject_teacher_context(self, sample: Dict) -> Dict:
+        context = self._resolve_teacher_context(sample)
+        if context is None:
+            return sample
+
+        messages = sample.get('messages')
+        if not isinstance(messages, list) or len(messages) == 0:
+            logger.warning_once('`teacher_context_field` is set but `messages` is missing. Skipping teacher context.')
+            return sample
+
+        new_sample = dict(sample)
+        new_messages = [dict(m) for m in messages]
+
+        user_idx = None
+        for idx in range(len(new_messages) - 1, -1, -1):
+            if new_messages[idx].get('role') == 'user':
+                user_idx = idx
+                break
+        if user_idx is None:
+            logger.warning_once('No user message found when injecting teacher context. Skipping teacher context.')
+            return new_sample
+
+        user_content = new_messages[user_idx].get('content', '')
+        if not isinstance(user_content, str):
+            logger.warning_once('User message content is non-string. Skipping teacher context for this sample.')
+            return new_sample
+
+        sep = self.teacher_context_separator if user_content else ''
+        new_messages[user_idx]['content'] = f'{user_content}{sep}{context}'
+        new_sample['messages'] = new_messages
+        return new_sample
+
+    def _build_teacher_batch(self, batch: List[Dict]) -> List[Dict]:
+        if not self.teacher_context_field:
+            return batch
+        return [self._inject_teacher_context(sample) for sample in batch]
+
     def _get_random_num(self) -> float:
         """Generate a deterministic random number consistent across all processes.
 
@@ -486,23 +537,36 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         from megatron.core.num_microbatches_calculator import get_num_microbatches
         return get_num_microbatches()
 
-    def _compute_teacher_logits(self, encoded_batches: List[Dict], vp_stage: Optional[int] = None) -> None:
+    def _compute_teacher_logits(self,
+                                encoded_batches: List[Dict],
+                                teacher_encoded_batches: Optional[List[Dict]] = None,
+                                vp_stage: Optional[int] = None) -> None:
         teacher_model = self.teacher_models[vp_stage or 0]
+        if teacher_encoded_batches is None:
+            teacher_encoded_batches = encoded_batches
+        assert len(encoded_batches) == len(teacher_encoded_batches)
 
-        for encoded_batch in encoded_batches:
+        for encoded_batch, teacher_encoded_batch in zip(encoded_batches, teacher_encoded_batches):
             # Deep copy to avoid modifying original batch
-            teacher_batch = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in encoded_batch.items()}
+            teacher_batch = {
+                k: v.clone() if isinstance(v, torch.Tensor) else v
+                for k, v in teacher_encoded_batch.items()
+            }
             teacher_batch.pop('data_source', None)
             teacher_data = self._prepare_batch(teacher_batch)
             teacher_data.pop('loss_scale', None)
+
+            teacher_labels = teacher_data.pop('labels', None)
+            teacher_loss_mask = teacher_labels != -100 if teacher_labels is not None else None
             # Remove labels so returns logits instead of loss
-            teacher_data.pop('labels', None)
             # Teacher forward with args override for correct hidden_size
             with self.load_teacher_model_context(), self._teacher_args_context(), torch.no_grad():
                 teacher_logits = forward_step_helper(teacher_model, teacher_data)
                 if teacher_logits is not None:
                     teacher_logits = teacher_logits.detach()
             encoded_batch['teacher_logits'] = teacher_logits
+            if teacher_loss_mask is not None:
+                encoded_batch['teacher_loss_mask'] = teacher_loss_mask
 
     def _replace_data_iterator(self, data_iterator, model):
         num_microbatches = self._get_num_microbatches()
@@ -532,6 +596,9 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
         # Split global batch back into micro-batches for encoding
         encoded_batches = []
+        use_teacher_context = bool(self.teacher_context_field) and any(
+            self._resolve_teacher_context(sample) is not None for sample in global_batch)
+        teacher_encoded_batches = [] if use_teacher_context else None
         micro_batch_size = len(global_batch) // num_microbatches
         for i in range(num_microbatches):
             start_idx = i * micro_batch_size
@@ -541,8 +608,11 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             # Store data_source for conditional SFT loss in loss_func
             encoded_batch['data_source'] = data_source
             encoded_batches.append(encoded_batch)
+            if teacher_encoded_batches is not None:
+                teacher_raw_batch = self._build_teacher_batch(raw_batch)
+                teacher_encoded_batches.append(self._encode_batch(teacher_raw_batch))
 
-        self._compute_teacher_logits(encoded_batches)
+        self._compute_teacher_logits(encoded_batches, teacher_encoded_batches=teacher_encoded_batches)
 
         # Increment step counter (used for deterministic random and weight sync)
         self._step += 1
@@ -588,33 +658,44 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         student_logits: torch.Tensor,
         teacher_logits: torch.Tensor,
         labels: torch.Tensor,
+        teacher_loss_mask: Optional[torch.Tensor] = None,
         beta: float = 0.5,
         chunk_size: int = 512,
     ) -> torch.Tensor:
         args = get_args()
-        mask = labels != -100
-        local_num_valid = mask.sum()
-        num_valid = local_num_valid.float()
+        student_mask = labels != -100
+        if teacher_loss_mask is None:
+            teacher_loss_mask = student_mask
 
+        # Apply temperature scaling and select response positions.
+        student_logits_masked = (student_logits
+                                 / self.temperature)[student_mask]  # [local_num_valid_tokens, partition_vocab_size]
+        teacher_logits_masked = (teacher_logits / self.temperature)[teacher_loss_mask]
+        del student_logits, teacher_logits
+
+        if student_logits_masked.shape[0] != teacher_logits_masked.shape[0]:
+            aligned_token_num = min(student_logits_masked.shape[0], teacher_logits_masked.shape[0])
+            logger.warning_once(
+                f'Unaligned student/teacher response token counts: '
+                f'{student_logits_masked.shape[0]} vs {teacher_logits_masked.shape[0]}. '
+                f'Truncating to {aligned_token_num} tokens.')
+            student_logits_masked = student_logits_masked[:aligned_token_num]
+            teacher_logits_masked = teacher_logits_masked[:aligned_token_num]
+
+        local_num_valid_int = student_logits_masked.shape[0]
+        if local_num_valid_int == 0:
+            return student_logits_masked.sum() * 0
+
+        num_valid = student_logits_masked.new_tensor(float(local_num_valid_int))
         # All-reduce num_valid across CP group for correct averaging
         if args.context_parallel_size > 1:
             torch.distributed.all_reduce(
                 num_valid, op=torch.distributed.ReduceOp.SUM, group=mpu.get_context_parallel_group())
 
-        if num_valid == 0:
-            return (student_logits.sum() * 0).reshape(())
-
         # Align vocab size between student and teacher
-        student_logits, teacher_logits = self._align_vocab_size(student_logits, teacher_logits)
+        student_logits_masked, teacher_logits_masked = self._align_vocab_size(
+            student_logits_masked, teacher_logits_masked)
 
-        # Apply temperature scaling and mask
-        student_logits_masked = (student_logits
-                                 / self.temperature)[mask]  # [local_num_valid_tokens, partition_vocab_size]
-        teacher_logits_masked = (teacher_logits / self.temperature)[mask]
-        del student_logits, teacher_logits
-
-        # Use local count for iteration, global count for averaging
-        local_num_valid_int = local_num_valid.item()
         total_loss = student_logits_masked.new_zeros(())
 
         if beta != 0 and beta != 1:
@@ -673,6 +754,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                   *,
                   labels: torch.Tensor,
                   teacher_logits: torch.Tensor,
+                  teacher_loss_mask: Optional[torch.Tensor] = None,
                   data_source: DataSource = DataSource.DATASET):
         """Compute GKD loss (JSD + optional SFT loss).
 
@@ -688,6 +770,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             student_logits=student_logits,
             teacher_logits=teacher_logits,
             labels=labels,
+            teacher_loss_mask=teacher_loss_mask,
             beta=self.beta,
         )
 
@@ -739,6 +822,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             data = next(data_iterator)
             data_source = data.pop('data_source', DataSource.DATASET)
             teacher_logits = data.pop('teacher_logits', None)
+            teacher_loss_mask = data.pop('teacher_loss_mask', None)
             data = self._prepare_batch(data, vp_stage)
         timers('batch-generator').stop()
 
@@ -751,7 +835,11 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             student_output = model(**data)
 
         return student_output, partial(
-            self.loss_func, labels=labels, teacher_logits=teacher_logits, data_source=data_source)
+            self.loss_func,
+            labels=labels,
+            teacher_logits=teacher_logits,
+            teacher_loss_mask=teacher_loss_mask,
+            data_source=data_source)
 
     def patched_validate_args(self, args, *_args, **kwargs):
         """Override patched_validate_args to adjust EP parameters for Dense student.

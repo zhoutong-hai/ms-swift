@@ -31,6 +31,8 @@ class RowPreprocessor:
                                 'label',
                                 'channel',
                                 'margin',
+                                'context',
+                                'teacher_context',
                             ]
 
     def __init__(self,
