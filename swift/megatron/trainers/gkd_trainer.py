@@ -11,12 +11,12 @@ import torch
 import torch.nn.functional as F
 from megatron.core import mpu
 from megatron.core.rerun_state_machine import RerunDataIterator
-from megatron.training import get_args, get_model, get_timers
+from megatron.training import get_args, get_model, get_timers, get_wandb_writer
 from megatron.training.utils import unwrap_model
 from transformers import AutoConfig
 
 from swift.llm import Template, get_model_info_meta, to_device
-from swift.utils import get_logger
+from swift.utils import JsonlWriter, get_logger, remove_response
 from ..argument import MegatronArguments
 from ..model import get_megatron_model_meta
 from ..utils import convert_hf_config, forward_step_helper, get_padding_to
@@ -109,6 +109,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         self.debug_prompt_dump_max_chars = int(os.environ.get('SWIFT_GKD_DEBUG_PROMPT_DUMP_MAX_CHARS', '4000'))
         self.debug_prompt_dump_tail_chars = int(os.environ.get('SWIFT_GKD_DEBUG_PROMPT_DUMP_TAIL_CHARS', '800'))
         self._debug_prompt_dump_count = 0
+        self._prepare_rollout_logging()
 
         # Get device for data processing
         self.device = torch.cuda.current_device()
@@ -140,6 +141,107 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             self._train_valid_test_dataset_provider.is_distributed = True
 
         super().train(train_dataset, val_dataset, data_collator)
+
+    def _prepare_rollout_logging(self):
+        args = self.args
+        self.log_completions = getattr(args, 'log_completions', False)
+        self.wandb_log_unique_prompts = bool(getattr(args, 'wandb_log_unique_prompts', False))
+        self.rollout_log_to_wandb = os.environ.get('SWIFT_GKD_ROLLOUT_LOG_TO_WANDB', '0') == '1'
+        self.rollout_log_max_rows = int(os.environ.get('SWIFT_GKD_ROLLOUT_LOG_MAX_ROWS', '8'))
+        self.rollout_log_text_max_chars = int(os.environ.get('SWIFT_GKD_ROLLOUT_LOG_TEXT_MAX_CHARS', '2000'))
+        self.rollout_jsonl_writer = JsonlWriter(os.path.join(args.save, 'gkd_rollouts.jsonl'), write_on_rank='master')
+
+    def _truncate_rollout_text(self, text: str) -> str:
+        if not isinstance(text, str):
+            text = str(text)
+        limit = self.rollout_log_text_max_chars
+        if limit <= 0 or len(text) <= limit:
+            return text
+        return f'{text[:limit]}\n... [truncated, total_chars={len(text)}]'
+
+    def _extract_prompt_completion(self, sample: Dict) -> tuple[str, str]:
+        messages = sample.get('messages')
+        if not isinstance(messages, list):
+            return '', ''
+
+        prompt_messages = [dict(m) for m in messages]
+        remove_response(prompt_messages)
+        prompt_text = self._format_messages_for_log({'messages': prompt_messages})
+
+        completion_text = ''
+        if len(messages) > 0:
+            last_msg = messages[-1]
+            if isinstance(last_msg, dict) and last_msg.get('role') == 'assistant':
+                completion_text = last_msg.get('content', '')
+        if not isinstance(completion_text, str):
+            completion_text = str(completion_text)
+        return prompt_text, completion_text
+
+    def _log_rollout_samples(self, batch: List[Dict], data_source: DataSource) -> None:
+        if not self.log_completions or data_source != DataSource.STUDENT:
+            return
+        if not batch:
+            return
+        if self.rollout_log_max_rows <= 0:
+            return
+
+        args = get_args()
+        if getattr(args, 'rank', 0) != 0:
+            return
+
+        rows = []
+        for sample in batch[:self.rollout_log_max_rows]:
+            prompt_text, completion_text = self._extract_prompt_completion(sample)
+            rows.append({
+                'step': self._step,
+                'request_id': sample.get('request_id'),
+                'finish_reason': sample.get('finish_reason'),
+                'is_truncated': sample.get('is_truncated'),
+                'prompt': self._truncate_rollout_text(prompt_text),
+                'completion': self._truncate_rollout_text(completion_text),
+            })
+
+        if not rows:
+            return
+
+        if self.wandb_log_unique_prompts:
+            dedup_rows = []
+            seen_prompts = set()
+            for row in rows:
+                prompt = row['prompt']
+                if prompt in seen_prompts:
+                    continue
+                seen_prompts.add(prompt)
+                dedup_rows.append(row)
+            rows = dedup_rows
+            if not rows:
+                return
+
+        self.rollout_jsonl_writer.append(rows)
+
+        if not self.rollout_log_to_wandb:
+            return
+
+        wandb_writer = get_wandb_writer()
+        if wandb_writer is None or getattr(self.args, 'report_to', None) != 'wandb':
+            return
+
+        try:
+            import wandb
+            table = wandb.Table(
+                columns=['step', 'request_id', 'finish_reason', 'is_truncated', 'prompt', 'completion'],
+                data=[[
+                    row['step'],
+                    row['request_id'],
+                    row['finish_reason'],
+                    row['is_truncated'],
+                    row['prompt'],
+                    row['completion'],
+                ] for row in rows],
+            )
+            wandb_writer.log({'gkd_rollouts': table})
+        except Exception as e:
+            logger.warning_once(f'Failed to log rollout samples to W&B table: {e}')
 
     def setup_model_and_optimizer(self, model_provider_func, model_type, *_args, **kwargs):
         """Setup model and optimizer, including teacher model.
@@ -670,6 +772,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             logger.warning_once('Teacher mode triggered but teacher generation is not implemented in Megatron GKD yet. '
                                 'Falling back to dataset responses.')
 
+        self._log_rollout_samples(global_batch, data_source)
         self._maybe_log_prompt_sample(global_batch, data_source)
 
         # Split global batch back into micro-batches for encoding
