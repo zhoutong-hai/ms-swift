@@ -102,6 +102,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         self.sft_alpha = getattr(args, 'sft_alpha', 0.0)  # Weight for SFT loss
         assert args.teacher_model is not None, 'Teacher model path is required for GKD training'
         self.use_vllm = getattr(args, 'use_vllm', False)
+        self.student_context_field = getattr(args, 'student_context_field', None)
+        self.student_context_separator = getattr(args, 'student_context_separator', '\n\n')
         self.teacher_context_field = getattr(args, 'teacher_context_field', 'context')
         self.teacher_context_separator = getattr(args, 'teacher_context_separator', '\n\n')
         self.debug_prompt_dump = os.environ.get('SWIFT_GKD_DEBUG_PROMPT_DUMP', '0') == '1'
@@ -470,10 +472,10 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         encoded_batch['num_samples'] = len(batch)
         return encoded_batch
 
-    def _resolve_teacher_context(self, sample: Dict) -> Optional[str]:
-        if not self.teacher_context_field:
+    def _resolve_context(self, sample: Dict, context_field: Optional[str]) -> Optional[str]:
+        if not context_field:
             return None
-        context = sample.get(self.teacher_context_field)
+        context = sample.get(context_field)
         if context is None:
             return None
         if not isinstance(context, str):
@@ -482,14 +484,19 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             return None
         return context
 
-    def _inject_teacher_context(self, sample: Dict) -> Dict:
-        context = self._resolve_teacher_context(sample)
+    def _inject_context(self,
+                        sample: Dict,
+                        context_field: Optional[str],
+                        context_separator: str,
+                        context_name: str) -> Dict:
+        context = self._resolve_context(sample, context_field)
         if context is None:
             return sample
 
         messages = sample.get('messages')
         if not isinstance(messages, list) or len(messages) == 0:
-            logger.warning_once('`teacher_context_field` is set but `messages` is missing. Skipping teacher context.')
+            logger.warning_once(
+                f'`{context_name}_context_field` is set but `messages` is missing. Skipping {context_name} context.')
             return sample
 
         new_sample = dict(sample)
@@ -501,18 +508,41 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 user_idx = idx
                 break
         if user_idx is None:
-            logger.warning_once('No user message found when injecting teacher context. Skipping teacher context.')
+            logger.warning_once(f'No user message found when injecting {context_name} context. '
+                                f'Skipping {context_name} context.')
             return new_sample
 
         user_content = new_messages[user_idx].get('content', '')
         if not isinstance(user_content, str):
-            logger.warning_once('User message content is non-string. Skipping teacher context for this sample.')
+            logger.warning_once(f'User message content is non-string. Skipping {context_name} context for this sample.')
             return new_sample
 
-        sep = self.teacher_context_separator if user_content else ''
+        sep = context_separator if user_content else ''
+        # Avoid duplicating context when the sample is re-processed.
+        if user_content == context or (sep and user_content.endswith(f'{sep}{context}')):
+            new_sample['messages'] = new_messages
+            return new_sample
+
         new_messages[user_idx]['content'] = f'{user_content}{sep}{context}'
         new_sample['messages'] = new_messages
         return new_sample
+
+    def _resolve_student_context(self, sample: Dict) -> Optional[str]:
+        return self._resolve_context(sample, self.student_context_field)
+
+    def _resolve_teacher_context(self, sample: Dict) -> Optional[str]:
+        return self._resolve_context(sample, self.teacher_context_field)
+
+    def _inject_student_context(self, sample: Dict) -> Dict:
+        return self._inject_context(sample, self.student_context_field, self.student_context_separator, 'student')
+
+    def _inject_teacher_context(self, sample: Dict) -> Dict:
+        return self._inject_context(sample, self.teacher_context_field, self.teacher_context_separator, 'teacher')
+
+    def _build_student_batch(self, batch: List[Dict]) -> List[Dict]:
+        if not self.student_context_field:
+            return batch
+        return [self._inject_student_context(sample) for sample in batch]
 
     def _build_teacher_batch(self, batch: List[Dict]) -> List[Dict]:
         if not self.teacher_context_field:
@@ -570,22 +600,30 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             return
 
         student_sample = batch[0]
-        teacher_sample = self._inject_teacher_context(student_sample)
+        student_view = self._inject_student_context(student_sample)
+        teacher_view = self._inject_teacher_context(student_view)
+        student_context = self._resolve_student_context(student_sample)
         teacher_context = self._resolve_teacher_context(student_sample)
 
-        student_prompt = self._truncate_log_text(self._format_messages_for_log(student_sample))
-        teacher_prompt = self._truncate_log_text(self._format_messages_for_log(teacher_sample))
-        context_preview = 'none'
+        student_prompt = self._truncate_log_text(self._format_messages_for_log(student_view))
+        teacher_prompt = self._truncate_log_text(self._format_messages_for_log(teacher_view))
+        student_context_preview = 'none'
+        teacher_context_preview = 'none'
+        if student_context is not None:
+            student_context_preview = self._truncate_log_text(student_context)
         if teacher_context is not None:
-            context_preview = self._truncate_log_text(teacher_context)
+            teacher_context_preview = self._truncate_log_text(teacher_context)
 
         logger.info(
             f'\n[GKD Debug Prompt Dump #{self._debug_prompt_dump_count + 1}] '
             f'step={self._step}, data_source={data_source}\n'
+            f'student_context_field={self.student_context_field}, '
+            f'student_context_present={student_context is not None}\n'
             f'teacher_context_field={self.teacher_context_field}, '
             f'teacher_context_present={teacher_context is not None}\n'
             f'--- Student Prompt ---\n{student_prompt}\n'
-            f'--- Teacher Context ---\n{context_preview}\n'
+            f'--- Student Context ---\n{student_context_preview}\n'
+            f'--- Teacher Context ---\n{teacher_context_preview}\n'
             f'--- Teacher Prompt ---\n{teacher_prompt}\n')
         self._debug_prompt_dump_count += 1
 
@@ -765,12 +803,16 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
         # On-policy mode: generate completions for the entire global batch at once
         if data_source == DataSource.STUDENT:
+            global_batch = self._build_student_batch(global_batch)
             local_batch = self._get_local_rollout_batch(global_batch)
             local_batch = self._generate_completions(local_batch)
             global_batch = self._gather_rollout_results(local_batch)
         elif data_source == DataSource.TEACHER:
             logger.warning_once('Teacher mode triggered but teacher generation is not implemented in Megatron GKD yet. '
                                 'Falling back to dataset responses.')
+            global_batch = self._build_student_batch(global_batch)
+        else:
+            global_batch = self._build_student_batch(global_batch)
 
         self._log_rollout_samples(global_batch, data_source)
         self._maybe_log_prompt_sample(global_batch, data_source)
